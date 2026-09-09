@@ -221,14 +221,16 @@ def simulate_render(model, battery_pct=85):
     c.set_color("ColorBlack")
 
     # Modal
-    if model["dialog_open"]:
+    is_modal = model.get("modal_open") or model.get("dialog_open", False)
+    if is_modal:
         c.set_color("ColorWhite")
         c.draw_rbox(14, 14, 100, 36, 3)
         c.set_color("ColorBlack")
         c.draw_rframe(14, 14, 100, 36, 3)
         c.set_font("FontSecondary")
-        reset_str = "> Reset Match <" if model["dialog_selection"] == 0 else "Reset Match"
-        toggle_format_str = "> Toggle Format <" if model["dialog_selection"] == 1 else "Toggle Format"
+        sel = model.get("modal_selection") if "modal_selection" in model else model.get("dialog_selection", 0)
+        reset_str = "> Reset Match <" if sel == 0 else "Reset Match"
+        toggle_format_str = "> Toggle Format <" if sel == 1 else "Toggle Format"
         c.draw_str_aligned(64, 26, "AlignCenter", "AlignCenter", reset_str)
         c.draw_str_aligned(64, 38, "AlignCenter", "AlignCenter", toggle_format_str)
 
@@ -397,4 +399,76 @@ def test_life_death_indicator(life, expect_box):
     ops = c.operations
     has_black_box = ("draw_box", 28, 20, 72, 24, "ColorBlack") in ops
     assert has_black_box == expect_box
+
+def test_simulation_dead_and_focused_life():
+    model = {
+        "format": 0, "life": 0, "poison": 0, "cmdr_dmg": [0, 0, 0],
+        "life_delta": 0, "focus": 0, "edit_mode": False, "dialog_open": False, "dialog_selection": 0
+    }
+    c = simulate_render(model)
+    ops = c.operations
+    # Both death box AND focus bounding frame should be present
+    assert ("draw_box", 28, 20, 72, 24, "ColorBlack") in ops
+    assert ("draw_frame", 24, 19, 80, 26, "ColorBlack") in ops
+    assert ("draw_str_aligned", 64, 32, "AlignCenter", "AlignCenter", "0", "ColorWhite", "FontBigNumbers") in ops
+
+def test_simulation_positive_life_delta():
+    model = {
+        "format": 0, "life": 20, "poison": 0, "cmdr_dmg": [0, 0, 0],
+        "life_delta": 5, "focus": 0, "edit_mode": False, "dialog_open": False, "dialog_selection": 0
+    }
+    c = simulate_render(model)
+    ops = c.operations
+    assert ("draw_str_aligned", 64, 15, "AlignCenter", "AlignCenter", "+5", "ColorBlack", "FontSecondary") in ops
+
+def test_simulation_modal_selection_reset():
+    model = {
+        "format": 0, "life": 40, "poison": 0, "cmdr_dmg": [0, 0, 0],
+        "life_delta": 0, "focus": 0, "edit_mode": False, "dialog_open": True, "dialog_selection": 0
+    }
+    c = simulate_render(model)
+    ops = c.operations
+    assert ("draw_str_aligned", 64, 26, "AlignCenter", "AlignCenter", "> Reset Match <", "ColorBlack", "FontSecondary") in ops
+    assert ("draw_str_aligned", 64, 38, "AlignCenter", "AlignCenter", "Toggle Format", "ColorBlack", "FontSecondary") in ops
+
+def test_simulation_modal_open_keys():
+    model = {
+        "format": 0, "life": 40, "poison": 0, "cmdr_dmg": [0, 0, 0],
+        "life_delta": 0, "focus": 0, "edit_mode": False, "modal_open": True, "modal_selection": 1
+    }
+    c = simulate_render(model)
+    ops = c.operations
+    assert ("draw_rbox", 14, 14, 100, 36, 3, "ColorWhite") in ops
+    assert ("draw_str_aligned", 64, 26, "AlignCenter", "AlignCenter", "Reset Match", "ColorBlack", "FontSecondary") in ops
+    assert ("draw_str_aligned", 64, 38, "AlignCenter", "AlignCenter", "> Toggle Format <", "ColorBlack", "FontSecondary") in ops
+
+@pytest.mark.parametrize("focus_id, cell_x, cell_tag", [
+    (2, 32, "C1:25"),
+    (3, 64, "C2:22"),
+    (4, 96, "C3:30"),
+])
+def test_simulation_cmdr_focused_and_lethal(focus_id, cell_x, cell_tag):
+    model = {
+        "format": 0, "life": 20, "poison": 0, "cmdr_dmg": [25, 22, 30],
+        "life_delta": 0, "focus": focus_id, "edit_mode": False, "dialog_open": False, "dialog_selection": 0
+    }
+    c = simulate_render(model)
+    ops = c.operations
+    assert ("draw_box", cell_x, 45, 32, 10, "ColorBlack") in ops
+    assert ("draw_frame", cell_x + 1, 46, 30, 8, "ColorWhite") in ops
+    assert ("draw_str_aligned", cell_x + 16, 50, "AlignCenter", "AlignCenter", cell_tag, "ColorWhite", "FontSecondary") in ops
+
+def test_simulation_multi_lethal_all_columns():
+    model = {
+        "format": 0, "life": -5, "poison": 15, "cmdr_dmg": [21, 22, 23],
+        "life_delta": -5, "focus": 0, "edit_mode": False, "dialog_open": False, "dialog_selection": 0
+    }
+    c = simulate_render(model)
+    ops = c.operations
+    # All 4 aux cells are lethal, unfocused: each has black frame
+    assert ("draw_frame", 1, 46, 30, 8, "ColorBlack") in ops
+    assert ("draw_frame", 33, 46, 30, 8, "ColorBlack") in ops
+    assert ("draw_frame", 65, 46, 30, 8, "ColorBlack") in ops
+    assert ("draw_frame", 97, 46, 30, 8, "ColorBlack") in ops
+
 

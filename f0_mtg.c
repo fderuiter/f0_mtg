@@ -222,7 +222,7 @@ static void f0_mtg_render_callback(Canvas* canvas, void* context) {
     canvas_set_color(canvas, ColorBlack);
 
     /* --- Modal Dialog --- */
-    if(app->model->dialog_open) {
+    if(app->model->modal_open || app->model->dialog_open) {
         /* Centered 100x36 rounded/bordered modal clearing background */
         canvas_set_color(canvas, ColorWhite);
         canvas_draw_rbox(canvas, 14, 14, 100, 36, 3);
@@ -231,11 +231,12 @@ static void f0_mtg_render_callback(Canvas* canvas, void* context) {
 
         /* Selectable items centered vertically */
         canvas_set_font(canvas, FontSecondary);
-        const char* reset_str = (app->model->dialog_selection == DialogSelectReset) ?
+        uint8_t selection = app->model->dialog_selection;
+        const char* reset_str = (selection == DialogSelectReset) ?
             "> Reset Match <" :
             "Reset Match";
         const char* toggle_format_str =
-            (app->model->dialog_selection == DialogSelectFormat) ?
+            (selection == DialogSelectFormat) ?
             "> Toggle Format <" :
             "Toggle Format";
 
