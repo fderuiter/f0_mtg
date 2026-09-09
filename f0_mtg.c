@@ -41,6 +41,7 @@ typedef struct {
     int16_t life_delta;
     uint32_t last_life_touch_tick;
     MtgFocus focus;
+    MtgFocus last_aux_focus;
     bool edit_mode;
     union {
         bool dialog_open;
@@ -278,6 +279,7 @@ static MtgApp* f0_mtg_app_alloc(void) {
     app->model->life_delta = 0;
     app->model->last_life_touch_tick = 0;
     app->model->focus = FocusLife;
+    app->model->last_aux_focus = FocusPoison;
     app->model->edit_mode = false;
     app->model->dialog_open = false;
     app->model->dialog_selection = DialogSelectReset;
@@ -314,6 +316,94 @@ static void f0_mtg_app_free(MtgApp* app) {
     free(app);
 }
 
+static void f0_mtg_reset_match(MtgModel* model) {
+    int16_t starting_life = (model->save_data.format == FormatStandard) ? 20 : 40;
+    model->save_data.life = starting_life;
+    model->save_data.poison = 0;
+    model->save_data.cmdr_dmg[0] = 0;
+    model->save_data.cmdr_dmg[1] = 0;
+    model->save_data.cmdr_dmg[2] = 0;
+    model->life_delta = 0;
+    model->focus = FocusLife;
+    model->last_aux_focus = FocusPoison;
+    model->modal_open = false;
+}
+
+static void f0_mtg_toggle_format(MtgModel* model) {
+    model->save_data.format = (model->save_data.format == FormatEDH) ?
+        FormatStandard :
+        FormatEDH;
+    f0_mtg_reset_match(model);
+}
+
+static void f0_mtg_cycle_focus(MtgModel* model, bool forward) {
+    if(forward) {
+        if(model->focus >= FocusCmdr3) {
+            model->focus = FocusLife;
+        } else {
+            model->focus++;
+        }
+    } else {
+        if(model->focus <= FocusLife) {
+            model->focus = FocusCmdr3;
+        } else {
+            model->focus--;
+        }
+    }
+
+    if(model->focus != FocusLife) {
+        model->last_aux_focus = model->focus;
+    }
+}
+
+static void f0_mtg_focus_jump(MtgModel* model) {
+    if(model->focus != FocusLife) {
+        model->focus = FocusLife;
+    } else {
+        if(model->last_aux_focus < FocusPoison || model->last_aux_focus > FocusCmdr3) {
+            model->last_aux_focus = FocusPoison;
+        }
+        model->focus = model->last_aux_focus;
+    }
+}
+
+static void f0_mtg_adjust_focused_counter(MtgModel* model, int16_t delta, uint32_t now_tick) {
+    if(model->focus == FocusLife) {
+        int32_t new_life = (int32_t)model->save_data.life + delta;
+        if(new_life > 999) {
+            new_life = 999;
+        } else if(new_life < -99) {
+            new_life = -99;
+        }
+        int16_t actual_delta = (int16_t)(new_life - model->save_data.life);
+        model->save_data.life = (int16_t)new_life;
+        model->life_delta += actual_delta;
+        model->last_life_touch_tick = now_tick;
+    } else {
+        uint8_t* val_ptr = NULL;
+        if(model->focus == FocusPoison) {
+            val_ptr = &model->save_data.poison;
+        } else if(model->focus == FocusCmdr1) {
+            val_ptr = &model->save_data.cmdr_dmg[0];
+        } else if(model->focus == FocusCmdr2) {
+            val_ptr = &model->save_data.cmdr_dmg[1];
+        } else if(model->focus == FocusCmdr3) {
+            val_ptr = &model->save_data.cmdr_dmg[2];
+        }
+
+        if(val_ptr) {
+            int32_t new_val = (int32_t)(*val_ptr) + delta;
+            if(new_val > 99) {
+                new_val = 99;
+            } else if(new_val < 0) {
+                new_val = 0;
+            }
+            *val_ptr = (uint8_t)new_val;
+            /* Modifying auxiliary counters must NOT alter life_delta */
+        }
+    }
+}
+
 int32_t f0_mtg_app(void* p) {
     UNUSED(p);
 
@@ -322,15 +412,206 @@ int32_t f0_mtg_app(void* p) {
     AppEvent event;
     bool running = true;
 
+    /* Long-press detection for KeyOk */
+    uint32_t ok_press_tick = 0;
+    bool ok_modal_opened = false;
+    bool ok_short_handled = false;
+
+    /* Acceleration engine state for Up/Down */
+    bool repeat_active = false;
+    InputKey repeat_key = InputKeyUp;
+    uint32_t repeat_press_start_tick = 0;
+    uint32_t repeat_last_tick = 0;
+
+    bool key_press_handled = false;
+
     while(running) {
-        FuriStatus status = furi_message_queue_get(app->event_queue, &event, FuriWaitForever);
+        FuriStatus status = furi_message_queue_get(app->event_queue, &event, 100);
+
+        uint32_t now = furi_get_tick();
+
+        /* Delta clearing: 3-second inactivity timeout */
+        if(app->model->life_delta != 0 && (now - app->model->last_life_touch_tick >= 3000)) {
+            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+            app->model->life_delta = 0;
+            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+            view_port_update(app->view_port);
+        }
+
         if(status != FuriStatusOk) {
             continue;
         }
 
         if(event.type == AppEventTypeInput) {
-            if(event.value.input.type == InputTypePress && event.value.input.key == InputKeyBack) {
-                running = false;
+            InputEvent* input = &event.value.input;
+
+            if(app->model->modal_open) {
+                /* --- Modal Controls --- */
+                if(input->key == InputKeyUp || input->key == InputKeyDown) {
+                    if(input->type == InputTypePress) {
+                        key_press_handled = true;
+                        furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+                        app->model->dialog_selection =
+                            (app->model->dialog_selection == DialogSelectReset) ?
+                            DialogSelectFormat :
+                            DialogSelectReset;
+                        furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                        view_port_update(app->view_port);
+                    } else if(input->type == InputTypeShort) {
+                        if(!key_press_handled) {
+                            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+                            app->model->dialog_selection =
+                                (app->model->dialog_selection == DialogSelectReset) ?
+                                DialogSelectFormat :
+                                DialogSelectReset;
+                            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                            view_port_update(app->view_port);
+                        }
+                        key_press_handled = false;
+                    }
+                } else if(input->key == InputKeyOk) {
+                    if(input->type == InputTypePress) {
+                        key_press_handled = true;
+                        furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+                        if(app->model->dialog_selection == DialogSelectFormat) {
+                            f0_mtg_toggle_format(app->model);
+                        } else {
+                            f0_mtg_reset_match(app->model);
+                        }
+                        furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                        view_port_update(app->view_port);
+                    } else if(input->type == InputTypeShort) {
+                        if(!key_press_handled) {
+                            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+                            if(app->model->dialog_selection == DialogSelectFormat) {
+                                f0_mtg_toggle_format(app->model);
+                            } else {
+                                f0_mtg_reset_match(app->model);
+                            }
+                            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                            view_port_update(app->view_port);
+                        }
+                        key_press_handled = false;
+                    }
+                } else if(input->key == InputKeyBack) {
+                    if(input->type == InputTypePress) {
+                        key_press_handled = true;
+                        furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+                        app->model->modal_open = false;
+                        furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                        view_port_update(app->view_port);
+                    } else if(input->type == InputTypeShort) {
+                        if(!key_press_handled) {
+                            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+                            app->model->modal_open = false;
+                            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                            view_port_update(app->view_port);
+                        }
+                        key_press_handled = false;
+                    }
+                }
+            } else {
+                /* --- Main Screen Controls --- */
+                if(input->key == InputKeyBack) {
+                    if(input->type == InputTypePress || input->type == InputTypeShort) {
+                        running = false;
+                    }
+                } else if(input->key == InputKeyLeft || input->key == InputKeyRight) {
+                    if(input->type == InputTypePress) {
+                        key_press_handled = true;
+                        furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+                        f0_mtg_cycle_focus(app->model, (input->key == InputKeyRight));
+                        furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                        view_port_update(app->view_port);
+                    } else if(input->type == InputTypeShort) {
+                        if(!key_press_handled) {
+                            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+                            f0_mtg_cycle_focus(app->model, (input->key == InputKeyRight));
+                            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                            view_port_update(app->view_port);
+                        }
+                        key_press_handled = false;
+                    }
+                } else if(input->key == InputKeyOk) {
+                    if(input->type == InputTypePress) {
+                        ok_press_tick = now;
+                        ok_modal_opened = false;
+                        ok_short_handled = false;
+                    } else if(input->type == InputTypeRepeat) {
+                        if(!ok_modal_opened && (now - ok_press_tick >= 1200)) {
+                            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+                            app->model->modal_open = true;
+                            app->model->dialog_selection = DialogSelectReset;
+                            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                            ok_modal_opened = true;
+                            view_port_update(app->view_port);
+                        }
+                    } else if(input->type == InputTypeRelease) {
+                        if(!ok_modal_opened && (now - ok_press_tick < 1200)) {
+                            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+                            f0_mtg_focus_jump(app->model);
+                            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                            ok_short_handled = true;
+                            view_port_update(app->view_port);
+                        }
+                        ok_modal_opened = false;
+                    } else if(input->type == InputTypeShort) {
+                        if(!ok_modal_opened && !ok_short_handled) {
+                            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+                            f0_mtg_focus_jump(app->model);
+                            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                            ok_short_handled = true;
+                            view_port_update(app->view_port);
+                        }
+                    }
+                } else if(input->key == InputKeyUp || input->key == InputKeyDown) {
+                    int16_t dir = (input->key == InputKeyUp) ? 1 : -1;
+                    if(input->type == InputTypePress) {
+                        repeat_active = true;
+                        repeat_key = input->key;
+                        repeat_press_start_tick = now;
+                        repeat_last_tick = now;
+                        key_press_handled = true;
+
+                        furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+                        f0_mtg_adjust_focused_counter(app->model, dir, now);
+                        furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                        view_port_update(app->view_port);
+                    } else if(input->type == InputTypeRepeat) {
+                        if(repeat_active && repeat_key == input->key) {
+                            uint32_t hold_duration = now - repeat_press_start_tick;
+                            if(hold_duration >= 400 && hold_duration <= 1400) {
+                                if(now - repeat_last_tick >= 100) {
+                                    furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+                                    f0_mtg_adjust_focused_counter(app->model, dir, now);
+                                    furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                                    repeat_last_tick = now;
+                                    view_port_update(app->view_port);
+                                }
+                            } else if(hold_duration > 1400) {
+                                if(now - repeat_last_tick >= 150) {
+                                    furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+                                    f0_mtg_adjust_focused_counter(app->model, dir * 5, now);
+                                    furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                                    repeat_last_tick = now;
+                                    view_port_update(app->view_port);
+                                }
+                            }
+                        }
+                    } else if(input->type == InputTypeRelease) {
+                        if(repeat_active && repeat_key == input->key) {
+                            repeat_active = false;
+                        }
+                    } else if(input->type == InputTypeShort) {
+                        if(!key_press_handled) {
+                            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+                            f0_mtg_adjust_focused_counter(app->model, dir, now);
+                            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                            view_port_update(app->view_port);
+                        }
+                        key_press_handled = false;
+                    }
+                }
             }
         }
     }
