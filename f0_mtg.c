@@ -414,6 +414,7 @@ int32_t f0_mtg_app(void* p) {
 
     /* Long-press detection for KeyOk */
     uint32_t ok_press_tick = 0;
+    bool ok_held = false;
     bool ok_modal_opened = false;
     bool ok_short_handled = false;
 
@@ -423,18 +424,39 @@ int32_t f0_mtg_app(void* p) {
     uint32_t repeat_press_start_tick = 0;
     uint32_t repeat_last_tick = 0;
 
-    bool key_press_handled = false;
+    /* Handled flags to prevent double-triggering across Press and Short */
+    bool modal_toggle_pressed = false;
+    bool lr_pressed = false;
+    bool updown_pressed = false;
+    bool back_pressed = false;
+
+    /* Tracks key that dismissed modal to prevent trailing Release/Short leakage */
+    InputKey modal_dismiss_key = InputKeyMAX;
 
     while(running) {
         FuriStatus status = furi_message_queue_get(app->event_queue, &event, 100);
 
         uint32_t now = furi_get_tick();
 
-        /* Delta clearing: 3-second inactivity timeout */
+        /* Delta clearing: 3-second inactivity timeout (thread-safe) */
+        bool delta_cleared = false;
+        furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
         if(app->model->life_delta != 0 && (now - app->model->last_life_touch_tick >= 3000)) {
-            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
             app->model->life_delta = 0;
+            delta_cleared = true;
+        }
+        furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+        if(delta_cleared) {
+            view_port_update(app->view_port);
+        }
+
+        /* Long-press detection for KeyOk: open modal via repeat or tick duration >= 1200ms */
+        if(ok_held && !ok_modal_opened && (now - ok_press_tick >= 1200)) {
+            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+            app->model->modal_open = true;
+            app->model->dialog_selection = DialogSelectReset;
             furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+            ok_modal_opened = true;
             view_port_update(app->view_port);
         }
 
@@ -445,11 +467,16 @@ int32_t f0_mtg_app(void* p) {
         if(event.type == AppEventTypeInput) {
             InputEvent* input = &event.value.input;
 
-            if(app->model->modal_open) {
+            bool is_modal = false;
+            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+            is_modal = app->model->modal_open;
+            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+
+            if(is_modal) {
                 /* --- Modal Controls --- */
                 if(input->key == InputKeyUp || input->key == InputKeyDown) {
                     if(input->type == InputTypePress) {
-                        key_press_handled = true;
+                        modal_toggle_pressed = true;
                         furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
                         app->model->dialog_selection =
                             (app->model->dialog_selection == DialogSelectReset) ?
@@ -458,7 +485,7 @@ int32_t f0_mtg_app(void* p) {
                         furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
                         view_port_update(app->view_port);
                     } else if(input->type == InputTypeShort) {
-                        if(!key_press_handled) {
+                        if(!modal_toggle_pressed) {
                             furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
                             app->model->dialog_selection =
                                 (app->model->dialog_selection == DialogSelectReset) ?
@@ -467,11 +494,21 @@ int32_t f0_mtg_app(void* p) {
                             furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
                             view_port_update(app->view_port);
                         }
-                        key_press_handled = false;
+                        modal_toggle_pressed = false;
+                    } else if(input->type == InputTypeRelease) {
+                        modal_toggle_pressed = false;
                     }
                 } else if(input->key == InputKeyOk) {
+                    if(input->type == InputTypeRelease || input->type == InputTypeShort) {
+                        if(ok_modal_opened) {
+                            /* Consume release of the long press that opened the modal */
+                            ok_modal_opened = false;
+                            ok_held = false;
+                            continue;
+                        }
+                    }
                     if(input->type == InputTypePress) {
-                        key_press_handled = true;
+                        modal_dismiss_key = InputKeyOk;
                         furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
                         if(app->model->dialog_selection == DialogSelectFormat) {
                             f0_mtg_toggle_format(app->model);
@@ -481,7 +518,8 @@ int32_t f0_mtg_app(void* p) {
                         furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
                         view_port_update(app->view_port);
                     } else if(input->type == InputTypeShort) {
-                        if(!key_press_handled) {
+                        if(modal_dismiss_key != InputKeyOk) {
+                            modal_dismiss_key = InputKeyOk;
                             furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
                             if(app->model->dialog_selection == DialogSelectFormat) {
                                 f0_mtg_toggle_format(app->model);
@@ -491,55 +529,73 @@ int32_t f0_mtg_app(void* p) {
                             furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
                             view_port_update(app->view_port);
                         }
-                        key_press_handled = false;
                     }
                 } else if(input->key == InputKeyBack) {
                     if(input->type == InputTypePress) {
-                        key_press_handled = true;
+                        modal_dismiss_key = InputKeyBack;
                         furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
                         app->model->modal_open = false;
                         furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
                         view_port_update(app->view_port);
                     } else if(input->type == InputTypeShort) {
-                        if(!key_press_handled) {
+                        if(modal_dismiss_key != InputKeyBack) {
+                            modal_dismiss_key = InputKeyBack;
                             furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
                             app->model->modal_open = false;
                             furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
                             view_port_update(app->view_port);
                         }
-                        key_press_handled = false;
                     }
                 }
             } else {
                 /* --- Main Screen Controls --- */
+                if(modal_dismiss_key != InputKeyMAX) {
+                    if(input->key == modal_dismiss_key) {
+                        if(input->type == InputTypeRelease) {
+                            continue;
+                        }
+                        if(input->type == InputTypeShort) {
+                            modal_dismiss_key = InputKeyMAX;
+                            continue;
+                        }
+                    }
+                    modal_dismiss_key = InputKeyMAX;
+                }
+
                 if(input->key == InputKeyBack) {
                     if(input->type == InputTypePress) {
+                        back_pressed = true;
                         running = false;
                     } else if(input->type == InputTypeShort) {
-                        if(!key_press_handled) {
+                        if(!back_pressed) {
                             running = false;
                         }
-                        key_press_handled = false;
+                        back_pressed = false;
+                    } else if(input->type == InputTypeRelease) {
+                        back_pressed = false;
                     }
                 } else if(input->key == InputKeyLeft || input->key == InputKeyRight) {
                     if(input->type == InputTypePress) {
-                        key_press_handled = true;
+                        lr_pressed = true;
                         furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
                         f0_mtg_cycle_focus(app->model, (input->key == InputKeyRight));
                         furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
                         view_port_update(app->view_port);
                     } else if(input->type == InputTypeShort) {
-                        if(!key_press_handled) {
+                        if(!lr_pressed) {
                             furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
                             f0_mtg_cycle_focus(app->model, (input->key == InputKeyRight));
                             furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
                             view_port_update(app->view_port);
                         }
-                        key_press_handled = false;
+                        lr_pressed = false;
+                    } else if(input->type == InputTypeRelease) {
+                        lr_pressed = false;
                     }
                 } else if(input->key == InputKeyOk) {
                     if(input->type == InputTypePress) {
                         ok_press_tick = now;
+                        ok_held = true;
                         ok_modal_opened = false;
                         ok_short_handled = false;
                     } else if(input->type == InputTypeRepeat) {
@@ -552,6 +608,7 @@ int32_t f0_mtg_app(void* p) {
                             view_port_update(app->view_port);
                         }
                     } else if(input->type == InputTypeRelease) {
+                        ok_held = false;
                         if(!ok_modal_opened && (now - ok_press_tick < 1200)) {
                             furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
                             f0_mtg_focus_jump(app->model);
@@ -576,7 +633,7 @@ int32_t f0_mtg_app(void* p) {
                         repeat_key = input->key;
                         repeat_press_start_tick = now;
                         repeat_last_tick = now;
-                        key_press_handled = true;
+                        updown_pressed = true;
 
                         furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
                         f0_mtg_adjust_focused_counter(app->model, dir, now);
@@ -607,14 +664,15 @@ int32_t f0_mtg_app(void* p) {
                         if(repeat_active && repeat_key == input->key) {
                             repeat_active = false;
                         }
+                        updown_pressed = false;
                     } else if(input->type == InputTypeShort) {
-                        if(!key_press_handled) {
+                        if(!updown_pressed) {
                             furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
                             f0_mtg_adjust_focused_counter(app->model, dir, now);
                             furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
                             view_port_update(app->view_port);
                         }
-                        key_press_handled = false;
+                        updown_pressed = false;
                     }
                 }
             }

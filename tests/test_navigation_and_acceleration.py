@@ -169,6 +169,7 @@ class MtgStateMachine:
 
         # Input tracking state
         self.ok_press_tick = 0
+        self.ok_held = False
         self.ok_modal_opened = False
         self.ok_short_handled = False
 
@@ -177,11 +178,22 @@ class MtgStateMachine:
         self.repeat_press_start_tick = 0
         self.repeat_last_tick = 0
 
-        self.key_press_handled = False
+        self.modal_toggle_pressed = False
+        self.lr_pressed = False
+        self.updown_pressed = False
+        self.back_pressed = False
+
+        self.modal_dismiss_key = None
 
     def check_delta_timeout(self, now):
         if self.life_delta != 0 and (now - self.last_life_touch_tick >= 3000):
             self.life_delta = 0
+            self.viewport_updates += 1
+
+        if self.ok_held and not self.ok_modal_opened and (now - self.ok_press_tick >= 1200):
+            self.modal_open = True
+            self.modal_selection = DialogSelection.DialogSelectReset
+            self.ok_modal_opened = True
             self.viewport_updates += 1
 
     def adjust_focused_counter(self, delta, now):
@@ -251,7 +263,7 @@ class MtgStateMachine:
         if self.modal_open:
             if key in (InputKey.InputKeyUp, InputKey.InputKeyDown):
                 if event_type == InputType.InputTypePress:
-                    self.key_press_handled = True
+                    self.modal_toggle_pressed = True
                     self.modal_selection = (
                         DialogSelection.DialogSelectFormat
                         if self.modal_selection == DialogSelection.DialogSelectReset
@@ -259,62 +271,84 @@ class MtgStateMachine:
                     )
                     self.viewport_updates += 1
                 elif event_type == InputType.InputTypeShort:
-                    if not self.key_press_handled:
+                    if not self.modal_toggle_pressed:
                         self.modal_selection = (
                             DialogSelection.DialogSelectFormat
                             if self.modal_selection == DialogSelection.DialogSelectReset
                             else DialogSelection.DialogSelectReset
                         )
                         self.viewport_updates += 1
-                    self.key_press_handled = False
+                    self.modal_toggle_pressed = False
+                elif event_type == InputType.InputTypeRelease:
+                    self.modal_toggle_pressed = False
             elif key == InputKey.InputKeyOk:
+                if event_type in (InputType.InputTypeRelease, InputType.InputTypeShort):
+                    if self.ok_modal_opened:
+                        self.ok_modal_opened = False
+                        self.ok_held = False
+                        return
                 if event_type == InputType.InputTypePress:
-                    self.key_press_handled = True
+                    self.modal_dismiss_key = InputKey.InputKeyOk
                     if self.modal_selection == DialogSelection.DialogSelectFormat:
                         self.toggle_format()
                     else:
                         self.reset_match()
                     self.viewport_updates += 1
                 elif event_type == InputType.InputTypeShort:
-                    if not self.key_press_handled:
+                    if self.modal_dismiss_key != InputKey.InputKeyOk:
+                        self.modal_dismiss_key = InputKey.InputKeyOk
                         if self.modal_selection == DialogSelection.DialogSelectFormat:
                             self.toggle_format()
                         else:
                             self.reset_match()
                         self.viewport_updates += 1
-                    self.key_press_handled = False
             elif key == InputKey.InputKeyBack:
                 if event_type == InputType.InputTypePress:
-                    self.key_press_handled = True
+                    self.modal_dismiss_key = InputKey.InputKeyBack
                     self.modal_open = False
                     self.viewport_updates += 1
                 elif event_type == InputType.InputTypeShort:
-                    if not self.key_press_handled:
+                    if self.modal_dismiss_key != InputKey.InputKeyBack:
+                        self.modal_dismiss_key = InputKey.InputKeyBack
                         self.modal_open = False
                         self.viewport_updates += 1
-                    self.key_press_handled = False
         else:
+            if self.modal_dismiss_key is not None:
+                if key == self.modal_dismiss_key:
+                    if event_type == InputType.InputTypeRelease:
+                        return
+                    if event_type == InputType.InputTypeShort:
+                        self.modal_dismiss_key = None
+                        return
+                self.modal_dismiss_key = None
+
             if key == InputKey.InputKeyBack:
                 if event_type == InputType.InputTypePress:
+                    self.back_pressed = True
                     self.running = False
                 elif event_type == InputType.InputTypeShort:
-                    if not self.key_press_handled:
+                    if not self.back_pressed:
                         self.running = False
-                    self.key_press_handled = False
+                    self.back_pressed = False
+                elif event_type == InputType.InputTypeRelease:
+                    self.back_pressed = False
             elif key in (InputKey.InputKeyLeft, InputKey.InputKeyRight):
                 forward = (key == InputKey.InputKeyRight)
                 if event_type == InputType.InputTypePress:
-                    self.key_press_handled = True
+                    self.lr_pressed = True
                     self.cycle_focus(forward)
                     self.viewport_updates += 1
                 elif event_type == InputType.InputTypeShort:
-                    if not self.key_press_handled:
+                    if not self.lr_pressed:
                         self.cycle_focus(forward)
                         self.viewport_updates += 1
-                    self.key_press_handled = False
+                    self.lr_pressed = False
+                elif event_type == InputType.InputTypeRelease:
+                    self.lr_pressed = False
             elif key == InputKey.InputKeyOk:
                 if event_type == InputType.InputTypePress:
                     self.ok_press_tick = now
+                    self.ok_held = True
                     self.ok_modal_opened = False
                     self.ok_short_handled = False
                 elif event_type == InputType.InputTypeRepeat:
@@ -324,6 +358,7 @@ class MtgStateMachine:
                         self.ok_modal_opened = True
                         self.viewport_updates += 1
                 elif event_type == InputType.InputTypeRelease:
+                    self.ok_held = False
                     if not self.ok_modal_opened and (now - self.ok_press_tick < 1200):
                         self.focus_jump()
                         self.ok_short_handled = True
@@ -341,7 +376,7 @@ class MtgStateMachine:
                     self.repeat_key = key
                     self.repeat_press_start_tick = now
                     self.repeat_last_tick = now
-                    self.key_press_handled = True
+                    self.updown_pressed = True
                     self.adjust_focused_counter(dir, now)
                     self.viewport_updates += 1
                 elif event_type == InputType.InputTypeRepeat:
@@ -360,11 +395,12 @@ class MtgStateMachine:
                 elif event_type == InputType.InputTypeRelease:
                     if self.repeat_active and self.repeat_key == key:
                         self.repeat_active = False
+                    self.updown_pressed = False
                 elif event_type == InputType.InputTypeShort:
-                    if not self.key_press_handled:
+                    if not self.updown_pressed:
                         self.adjust_focused_counter(dir, now)
                         self.viewport_updates += 1
-                    self.key_press_handled = False
+                    self.updown_pressed = False
 
 
 # ============================================================================
@@ -865,4 +901,107 @@ def test_aux_extreme_clamping_acceleration():
     app.handle_input(InputType.InputTypeRepeat, InputKey.InputKeyUp, now)
     assert app.poison == 99
     assert app.life_delta == 0
+
+def test_modal_reset_match_no_focus_leak_on_trailing_release_or_short():
+    app = MtgStateMachine()
+    # Hold OK to open modal
+    app.handle_input(InputType.InputTypePress, InputKey.InputKeyOk, 1000)
+    app.handle_input(InputType.InputTypeRepeat, InputKey.InputKeyOk, 2200)
+    assert app.modal_open
+    # Release opening hold
+    app.handle_input(InputType.InputTypeRelease, InputKey.InputKeyOk, 2250)
+    assert app.modal_open
+
+    # In modal, press OK to Reset Match
+    app.handle_input(InputType.InputTypePress, InputKey.InputKeyOk, 3000)
+    assert not app.modal_open
+    assert app.focus == MtgFocus.FocusLife
+
+    # Release and Short delivered by OS for the OK click
+    app.handle_input(InputType.InputTypeRelease, InputKey.InputKeyOk, 3050)
+    app.handle_input(InputType.InputTypeShort, InputKey.InputKeyOk, 3050)
+
+    # Focus must remain FocusLife (0), NOT leak into FocusPoison (1)
+    assert app.focus == MtgFocus.FocusLife
+    assert app.last_aux_focus == MtgFocus.FocusPoison
+
+def test_modal_toggle_format_no_focus_leak_on_trailing_release_or_short():
+    app = MtgStateMachine(format=MtgFormat.FormatEDH)
+    # Hold OK to open modal
+    app.handle_input(InputType.InputTypePress, InputKey.InputKeyOk, 1000)
+    app.handle_input(InputType.InputTypeRepeat, InputKey.InputKeyOk, 2200)
+    assert app.modal_open
+    app.handle_input(InputType.InputTypeRelease, InputKey.InputKeyOk, 2250)
+
+    # In modal, toggle selection to Format
+    app.handle_input(InputType.InputTypePress, InputKey.InputKeyDown, 2500)
+    app.handle_input(InputType.InputTypeShort, InputKey.InputKeyDown, 2500)
+    assert app.modal_selection == DialogSelection.DialogSelectFormat
+
+    # Press OK to Toggle Format
+    app.handle_input(InputType.InputTypePress, InputKey.InputKeyOk, 3000)
+    assert not app.modal_open
+    assert app.format == MtgFormat.FormatStandard
+    assert app.life == 20
+    assert app.focus == MtgFocus.FocusLife
+
+    # Trailing Release and Short from OK click must NOT leak into main screen jump
+    app.handle_input(InputType.InputTypeRelease, InputKey.InputKeyOk, 3050)
+    app.handle_input(InputType.InputTypeShort, InputKey.InputKeyOk, 3050)
+    assert app.focus == MtgFocus.FocusLife
+
+def test_modal_dismiss_back_no_app_exit_leak():
+    app = MtgStateMachine()
+    app.modal_open = True
+    # Press Back in modal to dismiss
+    app.handle_input(InputType.InputTypePress, InputKey.InputKeyBack, 1000)
+    assert not app.modal_open
+    assert app.running is True
+
+    # Trailing Release and Short from Back click must NOT exit app
+    app.handle_input(InputType.InputTypeRelease, InputKey.InputKeyBack, 1050)
+    app.handle_input(InputType.InputTypeShort, InputKey.InputKeyBack, 1050)
+    assert app.running is True
+
+    # Subsequent Back press on main screen exits app
+    app.handle_input(InputType.InputTypePress, InputKey.InputKeyBack, 2000)
+    assert app.running is False
+
+def test_long_hold_up_release_does_not_block_subsequent_short_press():
+    app = MtgStateMachine()
+    # Long hold Up to adjust life
+    app.handle_input(InputType.InputTypePress, InputKey.InputKeyUp, 1000)
+    app.handle_input(InputType.InputTypeRepeat, InputKey.InputKeyUp, 1500)
+    app.handle_input(InputType.InputTypeRelease, InputKey.InputKeyUp, 2000)
+    assert app.life > 40
+
+    # User taps Right to cycle focus (press + short)
+    app.handle_input(InputType.InputTypePress, InputKey.InputKeyRight, 2500)
+    app.handle_input(InputType.InputTypeShort, InputKey.InputKeyRight, 2500)
+    assert app.focus == MtgFocus.FocusPoison
+
+    # User taps Right using only Short (simulating single event injection)
+    app.handle_input(InputType.InputTypeShort, InputKey.InputKeyRight, 2600)
+    assert app.focus == MtgFocus.FocusCmdr1
+
+def test_ok_long_press_detection_via_tick_timeout_without_repeat():
+    app = MtgStateMachine()
+    # Press OK at t=1000
+    app.handle_input(InputType.InputTypePress, InputKey.InputKeyOk, 1000)
+    assert not app.modal_open
+
+    # Simulate periodic queue wait timeout checking delta and ticks at t=2100 (1100ms: not yet)
+    app.check_delta_timeout(2100)
+    assert not app.modal_open
+
+    # Tick at t=2200 (1200ms elapsed): opens modal directly on tick check!
+    app.check_delta_timeout(2200)
+    assert app.modal_open
+    assert app.modal_selection == DialogSelection.DialogSelectReset
+
+def test_source_guards_and_mutex_discipline():
+    src = read_source()
+    assert "modal_dismiss_key" in src, "f0_mtg.c must track modal_dismiss_key to prevent event leakage"
+    assert "ok_held" in src, "f0_mtg.c must track ok_held for tick-based modal detection"
+
 
