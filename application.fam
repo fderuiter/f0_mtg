@@ -3,6 +3,7 @@ App(
     name="MTG Companion",
     apptype=FlipperAppType.EXTERNAL,
     entry_point="f0_mtg_app",
+    stack_size=2 * 1024,
+    fap_category="Games",
     requires=["gui"],
-    stack_size=3 * 1024,
 )
