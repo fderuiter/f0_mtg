@@ -295,8 +295,12 @@ class MtgStateMachine:
                     self.key_press_handled = False
         else:
             if key == InputKey.InputKeyBack:
-                if event_type in (InputType.InputTypePress, InputType.InputTypeShort):
+                if event_type == InputType.InputTypePress:
                     self.running = False
+                elif event_type == InputType.InputTypeShort:
+                    if not self.key_press_handled:
+                        self.running = False
+                    self.key_press_handled = False
             elif key in (InputKey.InputKeyLeft, InputKey.InputKeyRight):
                 forward = (key == InputKey.InputKeyRight)
                 if event_type == InputType.InputTypePress:
@@ -631,16 +635,16 @@ def test_acceleration_stage1_and_stage2_timing():
     app.handle_input(InputType.InputTypeRepeat, InputKey.InputKeyUp, now + 1550)
     assert app.life == life_at_end_of_stage1 + 5
 
-    # At t = 2650 (100ms since last): interval 150 not met
-    app.handle_input(InputType.InputTypeRepeat, InputKey.InputKeyUp, now + 2650)
+    # At t = 2650 (now + 1650, 100ms since last): interval 150 not met
+    app.handle_input(InputType.InputTypeRepeat, InputKey.InputKeyUp, now + 1650)
     assert app.life == life_at_end_of_stage1 + 5
 
-    # At t = 2700 (150ms since last): fires (+5)
-    app.handle_input(InputType.InputTypeRepeat, InputKey.InputKeyUp, now + 2700)
+    # At t = 2700 (now + 1700, 150ms since last): fires (+5)
+    app.handle_input(InputType.InputTypeRepeat, InputKey.InputKeyUp, now + 1700)
     assert app.life == life_at_end_of_stage1 + 10
 
     # Release ends repeat
-    app.handle_input(InputType.InputTypeRelease, InputKey.InputKeyUp, now + 2750)
+    app.handle_input(InputType.InputTypeRelease, InputKey.InputKeyUp, now + 1750)
     assert not app.repeat_active
 
 def test_acceleration_decrement_down():

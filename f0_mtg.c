@@ -513,8 +513,13 @@ int32_t f0_mtg_app(void* p) {
             } else {
                 /* --- Main Screen Controls --- */
                 if(input->key == InputKeyBack) {
-                    if(input->type == InputTypePress || input->type == InputTypeShort) {
+                    if(input->type == InputTypePress) {
                         running = false;
+                    } else if(input->type == InputTypeShort) {
+                        if(!key_press_handled) {
+                            running = false;
+                        }
+                        key_press_handled = false;
                     }
                 } else if(input->key == InputKeyLeft || input->key == InputKeyRight) {
                     if(input->type == InputTypePress) {
