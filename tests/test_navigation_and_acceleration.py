@@ -783,3 +783,86 @@ def test_back_button_exits_app_when_modal_closed():
     assert app.running is True
     app.handle_input(InputType.InputTypePress, InputKey.InputKeyBack, 1000)
     assert app.running is False
+
+def test_save_data_struct_layout_and_size():
+    import struct
+    # Layout: uint32 magic, uint8 version, uint8 format, int16 life, uint8 poison, uint8 cmdr[3], uint8 reserved[20]
+    # Packed format: '< I B B h B 3B 20s'
+    fmt = '<IBBhB3B20s'
+    size = struct.calcsize(fmt)
+    assert size == 32, f"MtgSaveData packed size must be exactly 32 bytes, got {size}"
+
+def test_delta_timeout_reset_on_consecutive_life_changes():
+    app = MtgStateMachine()
+    # Life touched at t=1000
+    app.handle_input(InputType.InputTypePress, InputKey.InputKeyUp, 1000)
+    assert app.life_delta == 1
+
+    # Life touched again at t=3500 (2500ms later)
+    app.handle_input(InputType.InputTypePress, InputKey.InputKeyUp, 3500)
+    assert app.life_delta == 2
+
+    # At t=4500 (1000ms after second touch, but 3500ms after first): delta must NOT clear
+    app.check_delta_timeout(4500)
+    assert app.life_delta == 2
+
+    # At t=6500 (3000ms after second touch): delta clears
+    app.check_delta_timeout(6500)
+    assert app.life_delta == 0
+
+def test_ok_hold_boundary_1199_vs_1200():
+    # Exactly 1199ms: releases without opening modal, performs focus jump
+    app1 = MtgStateMachine()
+    app1.handle_input(InputType.InputTypePress, InputKey.InputKeyOk, 1000)
+    app1.handle_input(InputType.InputTypeRepeat, InputKey.InputKeyOk, 2199)
+    assert not app1.modal_open
+    app1.handle_input(InputType.InputTypeRelease, InputKey.InputKeyOk, 2199)
+    assert not app1.modal_open
+    assert app1.focus == MtgFocus.FocusPoison
+
+    # Exactly 1200ms: opens modal immediately on repeat
+    app2 = MtgStateMachine()
+    app2.handle_input(InputType.InputTypePress, InputKey.InputKeyOk, 1000)
+    app2.handle_input(InputType.InputTypeRepeat, InputKey.InputKeyOk, 2200)
+    assert app2.modal_open
+    # Subsequent release does NOT jump
+    app2.handle_input(InputType.InputTypeRelease, InputKey.InputKeyOk, 2300)
+    assert app2.focus == MtgFocus.FocusLife
+    assert app2.modal_open
+
+def test_life_extreme_clamping_acceleration():
+    app = MtgStateMachine()
+    app.life = 990
+    now = 1000
+    # Initial press: 991
+    app.handle_input(InputType.InputTypePress, InputKey.InputKeyUp, now)
+    assert app.life == 991
+    # Repeat stage 2 (> 1400ms hold, +5 per step)
+    now += 1550
+    app.handle_input(InputType.InputTypeRepeat, InputKey.InputKeyUp, now)
+    assert app.life == 996
+    now += 150
+    app.handle_input(InputType.InputTypeRepeat, InputKey.InputKeyUp, now)
+    assert app.life == 999
+    # Further stage 2 repeat attempts to add +5 -> clamped at 999
+    now += 150
+    app.handle_input(InputType.InputTypeRepeat, InputKey.InputKeyUp, now)
+    assert app.life == 999
+    assert app.life_delta == 9  # net change 999 - 990 = 9
+
+def test_aux_extreme_clamping_acceleration():
+    app = MtgStateMachine()
+    app.focus = MtgFocus.FocusPoison
+    app.poison = 95
+    now = 1000
+    app.handle_input(InputType.InputTypePress, InputKey.InputKeyUp, now)
+    assert app.poison == 96
+    now += 1550  # stage 2 (+5)
+    app.handle_input(InputType.InputTypeRepeat, InputKey.InputKeyUp, now)
+    # 96 + 5 = 101 -> clamped to 99
+    assert app.poison == 99
+    now += 150
+    app.handle_input(InputType.InputTypeRepeat, InputKey.InputKeyUp, now)
+    assert app.poison == 99
+    assert app.life_delta == 0
+
