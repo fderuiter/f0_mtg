@@ -1,5 +1,6 @@
 #include <furi.h>
 #include <furi_hal_power.h>
+#include <furi_hal_vibro.h>
 #include <gui/gui.h>
 #include <input/input.h>
 
@@ -51,7 +52,27 @@ typedef struct {
         uint8_t dialog_selection;
         uint8_t modal_selection;
     };
+    bool was_life_dead;
+    bool was_poison_dead;
+    bool was_cmdr_dead[3];
 } MtgModel;
+
+typedef enum {
+    HapticPatternNone = 0,
+    HapticPatternLife,
+    HapticPatternCmdr,
+    HapticPatternPoison,
+} HapticPattern;
+
+typedef struct {
+    FuriTimer* timer;
+    HapticPattern pattern;
+    uint8_t phase_index;
+    uint16_t phase_elapsed_ms;
+    uint16_t haptic_step;
+    const uint16_t* durations;
+    uint8_t total_phases;
+} HapticEngine;
 
 typedef enum {
     AppEventTypeInput,
@@ -72,6 +93,7 @@ typedef struct {
     Gui* gui;
     ViewPort* view_port;
     MtgModel* model;
+    HapticEngine haptic;
 } MtgApp;
 
 static void f0_mtg_render_callback(Canvas* canvas, void* context) {
@@ -259,6 +281,114 @@ static void f0_mtg_input_callback(InputEvent* input_event, void* context) {
     furi_message_queue_put(queue, &event, FuriWaitForever);
 }
 
+static const uint16_t HAPTIC_LIFE_DURATIONS[] = {400};
+static const uint16_t HAPTIC_CMDR_DURATIONS[] = {150, 100, 150};
+static const uint16_t HAPTIC_POISON_DURATIONS[] = {80, 50, 80, 50, 80};
+
+static void f0_mtg_haptic_stop(MtgApp* app) {
+    if(app->haptic.timer) {
+        furi_timer_stop(app->haptic.timer);
+    }
+    furi_hal_vibro_set(false);
+    app->haptic.pattern = HapticPatternNone;
+    app->haptic.phase_index = 0;
+    app->haptic.phase_elapsed_ms = 0;
+    app->haptic.haptic_step = 0;
+    app->haptic.total_phases = 0;
+    app->haptic.durations = NULL;
+}
+
+static void haptic_timer_callback(void* context) {
+    furi_assert(context);
+    MtgApp* app = (MtgApp*)context;
+
+    app->haptic.haptic_step++;
+    app->haptic.phase_elapsed_ms += 10;
+
+    if(app->haptic.durations == NULL || app->haptic.total_phases == 0) {
+        f0_mtg_haptic_stop(app);
+        return;
+    }
+
+    if(app->haptic.phase_elapsed_ms >= app->haptic.durations[app->haptic.phase_index]) {
+        app->haptic.phase_index++;
+        app->haptic.phase_elapsed_ms = 0;
+
+        if(app->haptic.phase_index >= app->haptic.total_phases) {
+            f0_mtg_haptic_stop(app);
+            return;
+        }
+
+        /* Even phases are ON, odd phases are OFF */
+        bool vibro_on = ((app->haptic.phase_index % 2) == 0);
+        furi_hal_vibro_set(vibro_on);
+    }
+}
+
+static void f0_mtg_haptic_start(MtgApp* app, HapticPattern pattern) {
+    if(!app->haptic.timer) {
+        return;
+    }
+    f0_mtg_haptic_stop(app);
+
+    switch(pattern) {
+    case HapticPatternLife:
+        app->haptic.durations = HAPTIC_LIFE_DURATIONS;
+        app->haptic.total_phases = sizeof(HAPTIC_LIFE_DURATIONS) / sizeof(HAPTIC_LIFE_DURATIONS[0]);
+        break;
+    case HapticPatternCmdr:
+        app->haptic.durations = HAPTIC_CMDR_DURATIONS;
+        app->haptic.total_phases = sizeof(HAPTIC_CMDR_DURATIONS) / sizeof(HAPTIC_CMDR_DURATIONS[0]);
+        break;
+    case HapticPatternPoison:
+        app->haptic.durations = HAPTIC_POISON_DURATIONS;
+        app->haptic.total_phases = sizeof(HAPTIC_POISON_DURATIONS) / sizeof(HAPTIC_POISON_DURATIONS[0]);
+        break;
+    default:
+        return;
+    }
+
+    app->haptic.pattern = pattern;
+    app->haptic.phase_index = 0;
+    app->haptic.phase_elapsed_ms = 0;
+    app->haptic.haptic_step = 0;
+    furi_hal_vibro_set(true);
+    furi_timer_start(app->haptic.timer, furi_ms_to_ticks(10));
+}
+
+static void f0_mtg_check_lethal_transitions(MtgApp* app) {
+    bool is_life_dead = (app->model->save_data.life <= 0);
+    bool is_poison_dead = (app->model->save_data.poison >= 10);
+    bool is_cmdr_dead[3] = {
+        app->model->save_data.cmdr_dmg[0] >= 21,
+        app->model->save_data.cmdr_dmg[1] >= 21,
+        app->model->save_data.cmdr_dmg[2] >= 21,
+    };
+
+    bool edge_life = !app->model->was_life_dead && is_life_dead;
+    bool edge_poison = !app->model->was_poison_dead && is_poison_dead;
+    bool edge_cmdr = (!app->model->was_cmdr_dead[0] && is_cmdr_dead[0]) ||
+                     (!app->model->was_cmdr_dead[1] && is_cmdr_dead[1]) ||
+                     (!app->model->was_cmdr_dead[2] && is_cmdr_dead[2]);
+
+    /* Update previous states so subsequent decrements or staying dead do not re-trigger,
+       and returning to safe thresholds resets edge flags */
+    app->model->was_life_dead = is_life_dead;
+    app->model->was_poison_dead = is_poison_dead;
+    app->model->was_cmdr_dead[0] = is_cmdr_dead[0];
+    app->model->was_cmdr_dead[1] = is_cmdr_dead[1];
+    app->model->was_cmdr_dead[2] = is_cmdr_dead[2];
+
+    /* Trigger alert with immediate preemption and priority: Life > Poison > Commander */
+    if(edge_life) {
+        f0_mtg_haptic_start(app, HapticPatternLife);
+    } else if(edge_poison) {
+        f0_mtg_haptic_start(app, HapticPatternPoison);
+    } else if(edge_cmdr) {
+        f0_mtg_haptic_start(app, HapticPatternCmdr);
+    }
+}
+
 static MtgApp* f0_mtg_app_alloc(void) {
     MtgApp* app = malloc(sizeof(MtgApp));
     furi_assert(app);
@@ -284,6 +414,13 @@ static MtgApp* f0_mtg_app_alloc(void) {
     app->model->dialog_open = false;
     app->model->dialog_selection = DialogSelectReset;
 
+    /* Initialize previous lethal states silently to prevent buzz on launch */
+    app->model->was_life_dead = (app->model->save_data.life <= 0);
+    app->model->was_poison_dead = (app->model->save_data.poison >= 10);
+    app->model->was_cmdr_dead[0] = (app->model->save_data.cmdr_dmg[0] >= 21);
+    app->model->was_cmdr_dead[1] = (app->model->save_data.cmdr_dmg[1] >= 21);
+    app->model->was_cmdr_dead[2] = (app->model->save_data.cmdr_dmg[2] >= 21);
+
     app->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     furi_assert(app->mutex);
 
@@ -296,6 +433,15 @@ static MtgApp* f0_mtg_app_alloc(void) {
     view_port_draw_callback_set(app->view_port, f0_mtg_render_callback, app);
     view_port_input_callback_set(app->view_port, f0_mtg_input_callback, app->event_queue);
 
+    app->haptic.timer = furi_timer_alloc(haptic_timer_callback, FuriTimerTypePeriodic, app);
+    furi_assert(app->haptic.timer);
+    app->haptic.pattern = HapticPatternNone;
+    app->haptic.phase_index = 0;
+    app->haptic.phase_elapsed_ms = 0;
+    app->haptic.haptic_step = 0;
+    app->haptic.durations = NULL;
+    app->haptic.total_phases = 0;
+
     app->gui = furi_record_open(RECORD_GUI);
     gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
 
@@ -304,6 +450,11 @@ static MtgApp* f0_mtg_app_alloc(void) {
 
 static void f0_mtg_app_free(MtgApp* app) {
     furi_assert(app);
+
+    f0_mtg_haptic_stop(app);
+    if(app->haptic.timer) {
+        furi_timer_free(app->haptic.timer);
+    }
 
     gui_remove_view_port(app->gui, app->view_port);
     furi_record_close(RECORD_GUI);
@@ -327,6 +478,11 @@ static void f0_mtg_reset_match(MtgModel* model) {
     model->focus = FocusLife;
     model->last_aux_focus = FocusPoison;
     model->modal_open = false;
+    model->was_life_dead = false;
+    model->was_poison_dead = false;
+    model->was_cmdr_dead[0] = false;
+    model->was_cmdr_dead[1] = false;
+    model->was_cmdr_dead[2] = false;
 }
 
 static void f0_mtg_toggle_format(MtgModel* model) {
@@ -516,6 +672,7 @@ int32_t f0_mtg_app(void* p) {
                             f0_mtg_reset_match(app->model);
                         }
                         furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                        f0_mtg_haptic_stop(app);
                         view_port_update(app->view_port);
                     } else if(input->type == InputTypeShort) {
                         if(modal_dismiss_key != InputKeyOk) {
@@ -527,6 +684,7 @@ int32_t f0_mtg_app(void* p) {
                                 f0_mtg_reset_match(app->model);
                             }
                             furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+                            f0_mtg_haptic_stop(app);
                             view_port_update(app->view_port);
                         }
                     }
@@ -637,6 +795,7 @@ int32_t f0_mtg_app(void* p) {
 
                         furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
                         f0_mtg_adjust_focused_counter(app->model, dir, now);
+                        f0_mtg_check_lethal_transitions(app);
                         furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
                         view_port_update(app->view_port);
                     } else if(input->type == InputTypeRepeat) {
@@ -646,6 +805,7 @@ int32_t f0_mtg_app(void* p) {
                                 if(now - repeat_last_tick >= 100) {
                                     furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
                                     f0_mtg_adjust_focused_counter(app->model, dir, now);
+                                    f0_mtg_check_lethal_transitions(app);
                                     furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
                                     repeat_last_tick = now;
                                     view_port_update(app->view_port);
@@ -654,6 +814,7 @@ int32_t f0_mtg_app(void* p) {
                                 if(now - repeat_last_tick >= 150) {
                                     furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
                                     f0_mtg_adjust_focused_counter(app->model, dir * 5, now);
+                                    f0_mtg_check_lethal_transitions(app);
                                     furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
                                     repeat_last_tick = now;
                                     view_port_update(app->view_port);
@@ -669,6 +830,7 @@ int32_t f0_mtg_app(void* p) {
                         if(!updown_pressed) {
                             furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
                             f0_mtg_adjust_focused_counter(app->model, dir, now);
+                            f0_mtg_check_lethal_transitions(app);
                             furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
                             view_port_update(app->view_port);
                         }
