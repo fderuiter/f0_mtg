@@ -5,6 +5,15 @@
 - **Thread Safety & Mutex Locking**: Synchronize all model reads (in `ViewPort` draw callbacks) and mutations (in event processing) using `FuriMutex`.
 - **Symmetric Resource Lifecycle**: Every allocated Furi primitive (`furi_mutex_alloc`, `furi_message_queue_alloc`, `view_port_alloc`, `furi_record_open`, `malloc`) must have a corresponding symmetric deallocation (`furi_mutex_free`, `furi_message_queue_free`, `view_port_free`, `furi_record_close`, `free`) in teardown routines.
 
+## Input Handling & State Machine Invariants
+- **Modal Dismissal & Trailing Event Isolation**: When closing or dismissing a modal dialog or transitioning screen states on an `InputTypePress` event (e.g., `KeyOk` or `KeyBack`), the physical button release will subsequently emit `InputTypeRelease` and `InputTypeShort` events. Always record a dismissal sentinel (`modal_dismiss_key`) and consume trailing release and short events to prevent accidental focus jumps or app exits on the newly active view.
+- **Per-Key Press Tracking**: Never use a single global `key_press_handled` flag across distinct buttons. Long holds for repeat acceleration do not emit synthetic `InputTypeShort` events upon release in Furi OS; un-scoped flags will poison subsequent inputs. Scope press flags per key or action and reset them cleanly on `InputTypeRelease`.
+- **Custom Long-Press Timing**: Furi OS triggers built-in `InputTypeLong` at ~300–500 ms. For custom thresholds (e.g., > 1.2s):
+  1. Record `press_start_tick` on `InputTypePress`.
+  2. Evaluate elapsed duration in `InputTypeRepeat`.
+  3. Also evaluate elapsed duration in the event loop's periodic queue wait timeout (e.g., 100 ms ticks) to guarantee prompt triggering even if repeat events are dropped or throttled.
+  4. On `InputTypeRelease`, suppress the short press action if the custom long-press threshold was already triggered.
+
 ## Display & Canvas Constraints (128x64 Monochrome)
 - **Screen Bounds**: X coordinates range from 0 to 127; Y coordinates range from 0 to 63.
 - **Font Availability**:
