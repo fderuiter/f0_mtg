@@ -1,3 +1,8 @@
 build/
 dist/
 .ufbt/
+.pytest_cache/
+tests\__pycache__/
+**\__pycache__/
+**\__pycache__\
+.mypy_cache/
